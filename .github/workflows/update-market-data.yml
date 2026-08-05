@@ -1,0 +1,73 @@
+name: Update Taiwan market data
+
+on:
+  schedule:
+    - cron: "20 14 * * 1-5"
+      timezone: "Asia/Taipei"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/update_market_data.py
+      - .github/workflows/update-market-data.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: taiwan-market-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out updater
+        uses: actions/checkout@v4
+
+      - name: Build and validate Yahoo snapshot
+        id: build
+        shell: bash
+        run: |
+          python3 scripts/update_market_data.py --output /tmp/taiwan-stock-data --workers 16
+          if [[ -f /tmp/taiwan-stock-data/market_manifest.json ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No trading-day snapshot was produced; the existing data branch is unchanged."
+          fi
+
+      - name: Publish validated snapshot
+        if: steps.build.outputs.ready == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin refs/heads/data >/dev/null 2>&1; then
+            git fetch origin data
+            git switch -C data origin/data
+          else
+            git switch --orphan data
+            git rm -rf --cached . >/dev/null 2>&1 || true
+          fi
+
+          rm -rf generated-data
+          cp -R /tmp/taiwan-stock-data generated-data
+          git add -A generated-data
+
+          if git diff --cached --quiet; then
+            echo "Validated snapshot is unchanged."
+            exit 0
+          fi
+
+          end_date="$(python3 -c 'import json; print(json.load(open("generated-data/market_manifest.json", encoding="utf-8"))["endDate"])')"
+          if git rev-parse --verify HEAD >/dev/null 2>&1; then
+            git commit --amend -m "Update market data ${end_date}"
+          else
+            git commit -m "Update market data ${end_date}"
+          fi
+          git push --force-with-lease origin HEAD:data
+
