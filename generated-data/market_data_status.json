@@ -1,0 +1,23 @@
+{
+  "meta": {
+    "startDate": "2016-01-01",
+    "endDate": "2026-09-04",
+    "stockCount": 1978,
+    "etfCount": 359,
+    "instrumentCount": 2337,
+    "requestedStockCount": 1978,
+    "requestedEtfCount": 359,
+    "generatedAt": "2026-09-04T19:26:14+08:00",
+    "companySource": "公開資訊觀測站、證交所與櫃買中心",
+    "priceSource": "Yahoo Finance"
+  },
+  "availableStockCount": 1978,
+  "availableEtfCount": 359,
+  "availableInstrumentCount": 2337,
+  "todayInstrumentCount": 2301,
+  "todayCoveragePct": 98.46,
+  "failedInstrumentCount": 0,
+  "fallbackInstrumentIds": [
+    "00972"
+  ]
+}

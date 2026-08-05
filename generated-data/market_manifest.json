@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "startDate": "2016-01-01",
+  "endDate": "2026-09-04",
+  "generatedAt": "2026-09-04T19:26:14+08:00",
+  "monthlyFile": "market_monthly.bin",
+  "years": [
+    2016,
+    2017,
+    2018,
+    2019,
+    2020,
+    2021,
+    2022,
+    2023,
+    2024,
+    2025,
+    2026
+  ],
+  "stockCount": 1978,
+  "etfCount": 359,
+  "instrumentCount": 2337,
+  "todayInstrumentCount": 2301,
+  "todayCoveragePct": 98.46,
+  "yearInstrumentCounts": {
+    "2016": 1688,
+    "2017": 1765,
+    "2018": 1836,
+    "2019": 1916,
+    "2020": 1951,
+    "2021": 2004,
+    "2022": 2066,
+    "2023": 2132,
+    "2024": 2217,
+    "2025": 2288,
+    "2026": 2337
+  },
+  "priceSource": "Yahoo Finance adjusted close",
+  "fallbackInstrumentIds": [
+    "00972"
+  ]
+}
