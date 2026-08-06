@@ -2,7 +2,7 @@ name: Update Taiwan market data
 
 on:
   schedule:
-    - cron: "20 14 * * 1-5"
+    - cron: "20,40 14-16 * * 1-5"
       timezone: "Asia/Taipei"
   workflow_dispatch:
   push:
@@ -27,7 +27,30 @@ jobs:
       - name: Check out updater
         uses: actions/checkout@v4
 
+      - name: Check whether today's snapshot is already published
+        id: freshness
+        shell: bash
+        run: |
+          taipei_date="$(TZ=Asia/Taipei date +%F)"
+          current_date=""
+
+          if git ls-remote --exit-code --heads origin refs/heads/data >/dev/null 2>&1; then
+            git fetch origin data
+            if git show origin/data:generated-data/market_manifest.json >/tmp/current_market_manifest.json 2>/dev/null; then
+              current_date="$(python3 -c 'import json; print(json.load(open("/tmp/current_market_manifest.json", encoding="utf-8")).get("endDate", ""))')"
+            fi
+          fi
+
+          echo "Taiwan date: ${taipei_date}; published endDate: ${current_date:-none}"
+          if [[ "$current_date" == "$taipei_date" ]]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Today's validated snapshot is already published; skipping this fallback run."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and validate Yahoo snapshot
+        if: steps.freshness.outputs.needed == 'true'
         id: build
         shell: bash
         run: |
@@ -70,4 +93,3 @@ jobs:
             git commit -m "Update market data ${end_date}"
           fi
           git push --force-with-lease origin HEAD:data
-
