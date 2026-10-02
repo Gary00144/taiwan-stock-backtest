@@ -23,7 +23,11 @@ Taiwan Stock Backtest site.
   is already covered by the published snapshot, including manual older dates.
 - When the global Yahoo chart has delayed/null recent closes, the updater repairs
   its tail from Yahoo Taiwan. Shared raw prices must match, and dividend changes
-  rebase the earlier adjusted history; a price-basis mismatch stops publication.
+  rebase the earlier adjusted history. Recent quotes are requested in batches of
+  20; dividend metadata is fetched only when Yahoo corporate actions or the
+  adjustment basis requires it. Unavailable or mismatched tails retain their
+  valid global history and are reported explicitly; current-day coverage still
+  gates publication at the original 90% threshold.
 - Recovery downloads full history, so a snapshot for a later day also restores
   missing earlier trading-day rows.
 

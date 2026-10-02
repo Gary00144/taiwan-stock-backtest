@@ -1,6 +1,6 @@
 import json
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from http.client import IncompleteRead
 from unittest.mock import MagicMock, patch
 
@@ -149,6 +149,62 @@ class RecentQuoteRecoveryTests(unittest.TestCase):
         mismatch = updater.DailyBar(date(2026, 9, 30), 25, 25, 25, 25, 10)
         with self.assertRaisesRegex(ValueError, "overlap disagrees"):
             updater.merge_yahoo_tw_tail([old], [mismatch])
+
+
+class BatchedRecoveryTests(unittest.TestCase):
+    def test_batch_response_is_matched_by_symbol_not_position(self):
+        stamp = int(datetime(2026, 10, 2, 1, tzinfo=timezone.utc).timestamp())
+        def entry(symbol, close):
+            return {"symbol": symbol, "chart": {"timestamp": [stamp], "indicators": {"quote": [{"open": [close], "close": [close], "volume": [10]}]}}}
+        payload = {"data": [entry("6488.TWO", 1190), entry("0050.TW", 112.8)]}
+        with patch.object(updater, "fetch_bytes", return_value=json.dumps(payload).encode()):
+            rows = updater.fetch_yahoo_tw_batch(["0050.TW", "6488.TWO"], date(2026, 10, 1), date(2026, 10, 2))
+        self.assertEqual(rows["0050.TW"][0][2], 112.8)
+        self.assertEqual(rows["6488.TWO"][0][2], 1190)
+
+    @patch.object(updater.time, "sleep")
+    def test_missing_recent_close_is_batched_without_unneeded_dividend_pages(self, sleep):
+        item = updater.Instrument("2330", "台積電", "TWSE", "2330.TW", "STOCK")
+        old = updater.DailyBar(date(2026, 9, 30), 100, 100, 100, 100, 10)
+        histories = {"2330": [old]}
+        sources = {"2330": "yahoo-global"}
+        raw = {"2330.TW": [(date(2026, 9, 30), 100, 100, 10), (date(2026, 10, 1), 101, 102, 10), (date(2026, 10, 2), 102, 103, 10)]}
+        with patch.object(updater, "fetch_yahoo_tw_batch", return_value=raw) as batch, \
+             patch.object(updater, "fetch_bytes") as dividend_page:
+            failed = updater.repair_recent_histories([item], histories, sources, {}, date(2026, 10, 2))
+        self.assertEqual(failed, [])
+        self.assertEqual(histories["2330"][-1].adj_close, 103)
+        self.assertEqual(sources["2330"], "yahoo-global-with-tw-tail")
+        batch.assert_called_once()
+        dividend_page.assert_not_called()
+
+    @patch.object(updater.time, "sleep")
+    def test_unavailable_tail_keeps_valid_history_and_reports_missing_price(self, sleep):
+        item = updater.Instrument("2235", "停牌標的", "TPEx", "2235.TWO", "STOCK")
+        old = updater.DailyBar(date(2026, 9, 24), 100, 100, 100, 100, 10)
+        histories = {"2235": [old]}
+        with patch.object(updater, "fetch_yahoo_tw_batch", return_value={}):
+            failed = updater.repair_recent_histories([item], histories, {}, {}, date(2026, 10, 2))
+        self.assertEqual(histories["2235"], [old])
+        self.assertEqual(failed[0]["stockId"], "2235")
+        self.assertFalse(any(row.trade_date == date(2026, 10, 2) for row in histories["2235"]))
+
+    @patch.object(updater.time, "sleep")
+    def test_dividend_event_requires_metadata_and_rebases_older_history(self, sleep):
+        item = updater.Instrument("2330", "台積電", "TWSE", "2330.TW", "STOCK")
+        old = updater.DailyBar(date(2026, 9, 30), 100, 100, 100, 100, 10)
+        histories = {"2330": [old]}
+        raw = {"2330.TW": [(date(2026, 9, 30), 100, 100, 10), (date(2026, 10, 2), 95, 96, 10)]}
+        stamp = int(datetime(2026, 10, 2, 1, tzinfo=timezone.utc).timestamp())
+        events = {"2330": {"dividends": {str(stamp): {"date": stamp, "amount": 5}}}}
+        with patch.object(updater, "fetch_yahoo_tw_batch", return_value=raw), \
+             patch.object(updater, "fetch_bytes", return_value=b"dividend metadata") as page, \
+             patch.object(updater, "parse_yahoo_tw_dividends", return_value=[(date(2026, 10, 2), 0.95)]):
+            failed = updater.repair_recent_histories([item], histories, {}, events, date(2026, 10, 2))
+        self.assertEqual(failed, [])
+        self.assertEqual(histories["2330"][0].adj_close, 95)
+        self.assertEqual(histories["2330"][-1].adj_close, 96)
+        page.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -252,8 +252,9 @@ def parse_yahoo_global(content: bytes, start: date, end_inclusive: date) -> list
     return sorted(output, key=lambda row: row.trade_date)
 
 
-def yahoo_tw_chart_url(symbol: str, ticks: int = 800) -> str:
-    encoded_symbols = quote(json.dumps([symbol], separators=(",", ":")))
+def yahoo_tw_chart_url(symbol: str | list[str], ticks: int = 800) -> str:
+    symbols = symbol if isinstance(symbol, list) else [symbol]
+    encoded_symbols = quote(json.dumps(symbols, separators=(",", ":")))
     return (
         f"{YAHOO_TW_CHART};symbols={encoded_symbols};period=d;numOfTicks={ticks};type=chart"
         "?device=desktop&intl=tw&lang=zh-Hant-TW&partner=none"
@@ -333,6 +334,13 @@ def fetch_yahoo_tw_adjusted(symbol: str, start: date, end_inclusive: date) -> li
         fetch_bytes(YAHOO_TW_DIVIDEND.format(symbol=quote(symbol))),
         end_inclusive,
     )
+    return adjusted_tw_rows(raw_rows, dividend_events)
+
+
+def adjusted_tw_rows(
+    raw_rows: list[tuple[date, float, float, int]],
+    dividend_events: list[tuple[date, float]],
+) -> list[DailyBar]:
     output: list[DailyBar] = []
     for trade_date, raw_open, raw_close, volume in raw_rows:
         factor = math.prod(value for ex_date, value in dividend_events if ex_date > trade_date)
@@ -349,7 +357,9 @@ def fetch_yahoo_tw_adjusted(symbol: str, start: date, end_inclusive: date) -> li
     return output
 
 
-def fetch_global_history(symbol: str, start: date, end_inclusive: date) -> list[DailyBar]:
+def fetch_global_history(
+    symbol: str, start: date, end_inclusive: date, *, events_out: dict[str, Any] | None = None,
+) -> list[DailyBar]:
     last_error = ""
     hosts = ("query1", "query2")
     for attempt in range(REQUEST_ATTEMPTS):
@@ -360,7 +370,11 @@ def fetch_global_history(symbol: str, start: date, end_inclusive: date) -> list[
                 timeout=75,
                 attempts=1,
             )
-            return parse_yahoo_global(content, start, end_inclusive)
+            rows = parse_yahoo_global(content, start, end_inclusive)
+            if events_out is not None:
+                result = json.loads(content)["chart"]["result"][0]
+                events_out.update(result.get("events") or {})
+            return rows
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
             if attempt + 1 < REQUEST_ATTEMPTS:
@@ -396,24 +410,98 @@ def merge_yahoo_tw_tail(global_rows: list[DailyBar], local_rows: list[DailyBar])
         )
         for row in global_rows
     ]
-    last_global_date = max(global_by_date)
-    output.extend(row for row in local_rows if row.trade_date > last_global_date)
+    output.extend(row for row in local_rows if row.trade_date not in global_by_date)
     return sorted(output, key=lambda row: row.trade_date)
 
 
-def fetch_instrument_history(instrument: Instrument, end_inclusive: date) -> tuple[list[DailyBar], str]:
+def fetch_instrument_history(
+    instrument: Instrument, end_inclusive: date, *, repair_tail: bool = True,
+    events_out: dict[str, Any] | None = None,
+) -> tuple[list[DailyBar], str]:
     # Yahoo Global currently has an incomplete historical start date for 00972.
     # Yahoo Taiwan contains its full local history; reconstruct adjusted prices
     # from the local price/dividend records rather than silently dropping it.
     if instrument.stock_id == "00972":
         rows = fetch_yahoo_tw_adjusted(instrument.symbol, START_DATE, end_inclusive)
         return rows, "yahoo-tw-adjusted"
-    rows = fetch_global_history(instrument.symbol, START_DATE, end_inclusive)
-    if rows[-1].trade_date < end_inclusive:
+    rows = fetch_global_history(instrument.symbol, START_DATE, end_inclusive, events_out=events_out)
+    if repair_tail and rows[-1].trade_date < end_inclusive:
         local_rows = fetch_yahoo_tw_adjusted(instrument.symbol, rows[-1].trade_date, end_inclusive)
         rows = merge_yahoo_tw_tail(rows, local_rows)
         return rows, "yahoo-global-with-tw-tail"
     return rows, "yahoo-global"
+
+
+def fetch_yahoo_tw_batch(symbols: list[str], start: date, end_inclusive: date) -> dict[str, list[tuple[date, float, float, int]]]:
+    payload = json.loads(fetch_bytes(yahoo_tw_chart_url(symbols)))
+    result: dict[str, list[tuple[date, float, float, int]]] = {}
+    for item in payload.get("data") or []:
+        symbol = item.get("symbol")
+        if symbol not in symbols:
+            continue
+        try:
+            content = json.dumps({"data": [item]}).encode()
+            rows = parse_yahoo_tw_raw(content, start, end_inclusive)
+            if rows:
+                result[symbol] = rows
+        except (ValueError, TypeError, KeyError):
+            continue
+    return result
+
+
+def repair_recent_histories(
+    instruments: list[Instrument], histories: dict[str, list[DailyBar]],
+    sources: dict[str, str], events: dict[str, dict[str, Any]], today: date,
+) -> list[dict[str, str]]:
+    """Batch recent quotes and retain valid older history for unavailable tails."""
+    failures: list[dict[str, str]] = []
+    start = today - timedelta(days=7)
+    for offset in range(0, len(instruments), 20):
+        group = instruments[offset:offset + 20]
+        try:
+            batch = fetch_yahoo_tw_batch([item.symbol for item in group], start, today)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            batch = {}
+            print(f"Yahoo Taiwan batch unavailable: {exc}", flush=True)
+        for item in group:
+            old_rows = histories[item.stock_id]
+            old_dates = {row.trade_date for row in old_rows}
+            raw_rows = batch.get(item.symbol, [])
+            if not raw_rows or not any(row[0] not in old_dates for row in raw_rows):
+                if old_rows[-1].trade_date < today:
+                    failures.append({"stockId": item.stock_id, "error": "No newer usable Yahoo Taiwan rows"})
+                continue
+            try:
+                shared = [row for row in old_rows if any(local[0] == row.trade_date for local in raw_rows)]
+                if not shared:
+                    raise ValueError("Yahoo Taiwan tail has no overlap with the global history")
+                anchor = shared[-1]
+                # The global API already supplies adjusted history and corporate
+                # actions. Most recent tails have no dividend: avoid thousands of
+                # identical dividend-page requests that trigger Yahoo rate limits.
+                dividend_data = (events.get(item.stock_id) or {}).get("dividends") or {}
+                recent_dividend = any(
+                    start < datetime.fromtimestamp(int(value.get("date", stamp)), TAIPEI).date() <= today
+                    for stamp, value in dividend_data.items()
+                )
+                needs_dividends = recent_dividend or abs(anchor.adj_close / anchor.raw_close - 1.0) > 0.000001
+                dividend_events = []
+                if needs_dividends:
+                    dividend_events = parse_yahoo_tw_dividends(
+                        fetch_bytes(YAHOO_TW_DIVIDEND.format(symbol=quote(item.symbol))), today,
+                    )
+                local_rows = adjusted_tw_rows(raw_rows, dividend_events)
+                histories[item.stock_id] = merge_yahoo_tw_tail(old_rows, local_rows)
+                sources[item.stock_id] = "yahoo-global-with-tw-tail"
+            except (RuntimeError, ValueError, TypeError, KeyError) as exc:
+                # The global history remains usable. Do not invent a current
+                # close or drop a suspended instrument; coverage still gates the
+                # entire snapshot and these IDs are recorded in its status.
+                failures.append({"stockId": item.stock_id, "error": str(exc)[:500]})
+        if (offset + len(group)) % 200 == 0 or offset + len(group) == len(instruments):
+            print(f"Yahoo Taiwan batched tail: {offset + len(group)}/{len(instruments)} unavailable={len(failures)}", flush=True)
+        time.sleep(0.3)
+    return failures
 
 
 def is_official_holiday(today: date) -> bool:
@@ -536,10 +624,14 @@ def build_assets(output_dir: Path, workers: int, today: date) -> None:
 
     histories: dict[str, list[DailyBar]] = {}
     sources: dict[str, str] = {}
+    corporate_events: dict[str, dict[str, Any]] = {item.stock_id: {} for item in instruments}
     failures: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(fetch_instrument_history, instrument, today): instrument
+            pool.submit(
+                fetch_instrument_history, instrument, today, repair_tail=False,
+                events_out=corporate_events[instrument.stock_id],
+            ): instrument
             for instrument in instruments
         }
         finished = 0
@@ -570,6 +662,8 @@ def build_assets(output_dir: Path, workers: int, today: date) -> None:
         raise RuntimeError(
             f"Yahoo history incomplete: {len(failures)}/{len(instruments)} instruments failed. {sample}"
         )
+
+    tail_failures = repair_recent_histories(instruments, histories, sources, corporate_events, today)
 
     today_count = sum(
         any(row.trade_date == today for row in histories[instrument.stock_id])
@@ -676,6 +770,8 @@ def build_assets(output_dir: Path, workers: int, today: date) -> None:
         "yearInstrumentCounts": year_counts,
         "priceSource": "Yahoo Finance adjusted close",
         "fallbackInstrumentIds": fallback_ids,
+        "tailRepairUnavailableCount": len(tail_failures),
+        "tailRepairUnavailableInstrumentIds": sorted({row["stockId"] for row in tail_failures}),
     }
     (output_dir / "market_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -692,6 +788,8 @@ def build_assets(output_dir: Path, workers: int, today: date) -> None:
                 "todayCoveragePct": round(today_coverage * 100, 2),
                 "failedInstrumentCount": 0,
                 "fallbackInstrumentIds": fallback_ids,
+                "tailRepairUnavailableCount": len(tail_failures),
+                "tailRepairUnavailable": tail_failures,
             },
             ensure_ascii=False,
             indent=2,
