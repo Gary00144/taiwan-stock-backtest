@@ -46,6 +46,7 @@ MOPS_LISTED = "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv"
 MOPS_OTC = "https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv"
 TWSE_STOCK_MASTER = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
 TPEX_STOCK_MASTER = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+TWSE_HOLIDAYS = "https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule"
 TWSE_DAILY = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_DAILY = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 YAHOO_GLOBAL = "https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -367,6 +368,39 @@ def fetch_global_history(symbol: str, start: date, end_inclusive: date) -> list[
     raise RuntimeError(last_error or "Yahoo global history failed")
 
 
+def merge_yahoo_tw_tail(global_rows: list[DailyBar], local_rows: list[DailyBar]) -> list[DailyBar]:
+    """Keep the full adjusted history and repair its delayed recent Yahoo rows."""
+    global_by_date = {row.trade_date: row for row in global_rows}
+    local_by_date = {row.trade_date: row for row in local_rows}
+    common_dates = global_by_date.keys() & local_by_date.keys()
+    if not common_dates:
+        raise ValueError("Yahoo Taiwan tail has no overlap with the global history")
+    overlap_date = max(common_dates)
+    old = global_by_date[overlap_date]
+    current = local_by_date[overlap_date]
+    tolerance = max(0.0001, old.raw_close * 0.000001)
+    if abs(old.raw_close - current.raw_close) > tolerance:
+        raise ValueError(
+            f"Yahoo raw-price overlap disagrees on {overlap_date}: {old.raw_close} vs {current.raw_close}"
+        )
+    # A dividend during the missing tail changes the adjustment basis of *all*
+    # earlier prices. Align on a shared raw-price date; never append raw prices
+    # to an adjusted series or replace its older split-adjusted history.
+    factor = current.adj_close / old.adj_close
+    if abs(factor - 1.0) < 0.000001:
+        factor = 1.0  # Ignore float precision differences between Yahoo feeds.
+    output = [
+        DailyBar(
+            row.trade_date, row.raw_open, round(row.adj_open * factor, 6),
+            row.raw_close, round(row.adj_close * factor, 6), row.volume,
+        )
+        for row in global_rows
+    ]
+    last_global_date = max(global_by_date)
+    output.extend(row for row in local_rows if row.trade_date > last_global_date)
+    return sorted(output, key=lambda row: row.trade_date)
+
+
 def fetch_instrument_history(instrument: Instrument, end_inclusive: date) -> tuple[list[DailyBar], str]:
     # Yahoo Global currently has an incomplete historical start date for 00972.
     # Yahoo Taiwan contains its full local history; reconstruct adjusted prices
@@ -375,22 +409,57 @@ def fetch_instrument_history(instrument: Instrument, end_inclusive: date) -> tup
         rows = fetch_yahoo_tw_adjusted(instrument.symbol, START_DATE, end_inclusive)
         return rows, "yahoo-tw-adjusted"
     rows = fetch_global_history(instrument.symbol, START_DATE, end_inclusive)
+    if rows[-1].trade_date < end_inclusive:
+        local_rows = fetch_yahoo_tw_adjusted(instrument.symbol, rows[-1].trade_date, end_inclusive)
+        rows = merge_yahoo_tw_tail(rows, local_rows)
+        return rows, "yahoo-global-with-tw-tail"
     return rows, "yahoo-global"
 
 
+def is_official_holiday(today: date) -> bool:
+    if today.weekday() >= 5:
+        return True
+    calendar_rows = json.loads(fetch_bytes(TWSE_HOLIDAYS))
+    if not isinstance(calendar_rows, list):
+        raise RuntimeError("TWSE trading calendar did not return a list")
+    covered_years: set[int] = set()
+    for row in calendar_rows:
+        raw = str(row.get("Date", "")).strip()
+        if re.fullmatch(r"\d{7}", raw):
+            calendar_date = date(int(raw[:3]) + 1911, int(raw[3:5]), int(raw[5:7]))
+        elif re.fullmatch(r"\d{8}", raw):
+            calendar_date = date(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
+        else:
+            continue
+        covered_years.add(calendar_date.year)
+        # The official feed also lists the first/last *open* trading days.
+        event = str(row.get("Name", "")) + str(row.get("Description", ""))
+        if calendar_date == today:
+            return not any(marker in event for marker in ("開始交易", "最後交易"))
+    if today.year not in covered_years:
+        raise RuntimeError(f"TWSE trading calendar does not cover {today.year}")
+    return False
+
+
 def preflight_is_trading_day(today: date) -> bool:
-    start = today - timedelta(days=3)
     hits = 0
     errors: list[str] = []
     for symbol in ("0050.TW", "2330.TW"):
         try:
-            rows = fetch_global_history(symbol, start, today)
+            # Preflight must use the same validated history/fallback as the build.
+            stock_id = symbol.split(".")[0]
+            anchor = Instrument(stock_id, stock_id, "TWSE", symbol, "ETF" if stock_id == "0050" else "STOCK")
+            rows, _ = fetch_instrument_history(anchor, today)
             if any(row.trade_date == today for row in rows):
                 hits += 1
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{symbol}: {exc}")
     if hits == 0 and not errors:
-        return False
+        if is_official_holiday(today):
+            return False
+        raise RuntimeError(
+            f"Yahoo anchors have no prices for the open trading day {today.isoformat()}; retry instead of skipping"
+        )
     if hits == 0 and errors:
         raise RuntimeError("Yahoo preflight failed: " + "; ".join(errors))
     if hits != 2:

@@ -21,6 +21,9 @@ Taiwan Stock Backtest site.
   uses TWSE/TPEx official company OpenAPI feeds, with per-market size checks.
 - A failed build is retried up to three times. Freshness checks skip any date that
   is already covered by the published snapshot, including manual older dates.
+- When the global Yahoo chart has delayed/null recent closes, the updater repairs
+  its tail from Yahoo Taiwan. Shared raw prices must match, and dividend changes
+  rebase the earlier adjusted history; a price-basis mismatch stops publication.
 - Recovery downloads full history, so a snapshot for a later day also restores
   missing earlier trading-day rows.
 
@@ -33,7 +36,9 @@ Taiwan Stock Backtest site.
 - At least 90% of the instrument universe must contain the current trading-day
   row. Suspended/non-trading securities may legitimately be absent that day.
 - If any required validation fails, the previous `data` branch is left intact.
-- Holidays produce no snapshot and leave the previous `data` branch intact.
+- A no-price response is treated as a holiday only when the TWSE calendar confirms
+  closure. Missing anchor prices on an open day fail and trigger recovery retries.
+- Verified holidays produce no snapshot and leave the previous `data` branch intact.
 
 ## Published data
 

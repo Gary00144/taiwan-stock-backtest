@@ -92,5 +92,64 @@ class RecoveryDateTests(unittest.TestCase):
             build.assert_not_called()
 
 
+class TradingDayRecoveryTests(unittest.TestCase):
+    def test_short_chart_delay_cannot_be_reported_as_a_holiday(self):
+        older = updater.DailyBar(date(2026, 9, 30), 1, 1, 1, 1, 1)
+        calendar = [{"Date": "1150925", "Name": "中秋節", "Description": "依規定放假1日。"}]
+        with patch.object(updater, "fetch_instrument_history", return_value=([older], "yahoo-global")) as history, \
+             patch.object(updater, "fetch_bytes", return_value=json.dumps(calendar).encode()):
+            with self.assertRaisesRegex(RuntimeError, "retry instead of skipping"):
+                updater.preflight_is_trading_day(date(2026, 10, 2))
+            self.assertEqual(history.call_count, 2)
+
+    def test_verified_holiday_skips_without_publishing(self):
+        older = updater.DailyBar(date(2026, 9, 24), 1, 1, 1, 1, 1)
+        calendar = [{"Date": "1150925", "Name": "中秋節", "Description": "依規定放假1日。"}]
+        with patch.object(updater, "fetch_instrument_history", return_value=([older], "yahoo-global")), \
+             patch.object(updater, "fetch_bytes", return_value=json.dumps(calendar).encode()):
+            self.assertFalse(updater.preflight_is_trading_day(date(2026, 9, 25)))
+
+    def test_open_day_calendar_entries_are_not_holidays(self):
+        calendar = [{"Date": "1150102", "Name": "國曆新年開始交易日", "Description": "國曆新年開始交易。"}]
+        with patch.object(updater, "fetch_bytes", return_value=json.dumps(calendar).encode()):
+            self.assertFalse(updater.is_official_holiday(date(2026, 1, 2)))
+
+    def test_calendar_for_another_year_does_not_confirm_a_holiday(self):
+        calendar = [{"Date": "1150101", "Name": "元旦"}]
+        with patch.object(updater, "fetch_bytes", return_value=json.dumps(calendar).encode()):
+            with self.assertRaisesRegex(RuntimeError, "does not cover"):
+                updater.is_official_holiday(date(2027, 1, 4))
+
+
+class RecentQuoteRecoveryTests(unittest.TestCase):
+    def test_delayed_global_close_uses_the_validated_taiwan_tail(self):
+        old = updater.DailyBar(date(2026, 9, 30), 100, 100, 100, 100, 10)
+        overlap = updater.DailyBar(date(2026, 9, 30), 100, 100, 100, 100, 10)
+        new = updater.DailyBar(date(2026, 10, 2), 101, 101, 102, 102, 20)
+        item = updater.Instrument("2330", "台積電", "TWSE", "2330.TW", "STOCK")
+        with patch.object(updater, "fetch_global_history", return_value=[old]), \
+             patch.object(updater, "fetch_yahoo_tw_adjusted", return_value=[overlap, new]):
+            rows, source = updater.fetch_instrument_history(item, date(2026, 10, 2))
+        self.assertEqual(rows[-1], new)
+        self.assertEqual(source, "yahoo-global-with-tw-tail")
+
+    def test_dividend_in_missing_days_rebases_the_entire_older_history(self):
+        first = updater.DailyBar(date(2016, 1, 4), 50, 40, 50, 40, 10)
+        old = updater.DailyBar(date(2026, 9, 30), 100, 100, 100, 100, 10)
+        local_old = updater.DailyBar(date(2026, 9, 30), 100, 95, 100, 95, 10)
+        current = updater.DailyBar(date(2026, 10, 2), 95, 95, 96, 96, 20)
+        rows = updater.merge_yahoo_tw_tail([first, old], [local_old, current])
+        self.assertEqual(rows[0].adj_close, 38)
+        self.assertEqual(rows[0].raw_close, 50)
+        self.assertEqual(rows[1].adj_close, 95)
+        self.assertEqual(rows[2].adj_close, 96)
+
+    def test_price_basis_mismatch_is_rejected(self):
+        old = updater.DailyBar(date(2026, 9, 30), 100, 100, 100, 100, 10)
+        mismatch = updater.DailyBar(date(2026, 9, 30), 25, 25, 25, 25, 10)
+        with self.assertRaisesRegex(ValueError, "overlap disagrees"):
+            updater.merge_yahoo_tw_tail([old], [mismatch])
+
+
 if __name__ == "__main__":
     unittest.main()
