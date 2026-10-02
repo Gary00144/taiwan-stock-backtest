@@ -4,7 +4,14 @@ on:
   schedule:
     - cron: "20,40 14-16 * * 1-5"
       timezone: "Asia/Taipei"
+    - cron: "20 20 * * 1-5"
+      timezone: "Asia/Taipei"
   workflow_dispatch:
+    inputs:
+      date:
+        description: "Closed trading date to recover (YYYY-MM-DD); blank uses the latest closed weekday"
+        required: false
+        type: string
   push:
     branches:
       - main
@@ -27,11 +34,28 @@ jobs:
       - name: Check out updater
         uses: actions/checkout@v4
 
-      - name: Check whether today's snapshot is already published
+      - name: Check updater regression tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Check whether the target snapshot is already published
         id: freshness
         shell: bash
+        env:
+          REQUESTED_DATE: ${{ inputs.date || '' }}
         run: |
-          taipei_date="$(TZ=Asia/Taipei date +%F)"
+          target_date="$(python3 - <<'PY'
+          import os
+          from datetime import date
+          from scripts.update_market_data import default_target_date
+          latest = default_target_date()
+          raw = os.environ.get("REQUESTED_DATE", "").strip()
+          target = date.fromisoformat(raw) if raw else latest
+          if target > latest:
+              raise SystemExit("Requested date is later than the latest closed weekday")
+          print(target.isoformat())
+          PY
+          )"
+          echo "target_date=${target_date}" >> "$GITHUB_OUTPUT"
           current_date=""
 
           if git ls-remote --exit-code --heads origin refs/heads/data >/dev/null 2>&1; then
@@ -41,10 +65,10 @@ jobs:
             fi
           fi
 
-          echo "Taiwan date: ${taipei_date}; published endDate: ${current_date:-none}"
-          if [[ "$current_date" == "$taipei_date" ]]; then
+          echo "Target closed date: ${target_date}; published endDate: ${current_date:-none}"
+          if [[ "$current_date" == "$target_date" || "$current_date" > "$target_date" ]]; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
-            echo "Today's validated snapshot is already published; skipping this fallback run."
+            echo "The target date or a newer validated snapshot is already published; skipping."
           else
             echo "needed=true" >> "$GITHUB_OUTPUT"
           fi
@@ -53,8 +77,21 @@ jobs:
         if: steps.freshness.outputs.needed == 'true'
         id: build
         shell: bash
+        env:
+          TARGET_DATE: ${{ steps.freshness.outputs.target_date }}
         run: |
-          python3 scripts/update_market_data.py --output /tmp/taiwan-stock-data --workers 16
+          for attempt in 1 2 3; do
+            rm -rf /tmp/taiwan-stock-data
+            if python3 scripts/update_market_data.py --output /tmp/taiwan-stock-data --workers 16 --date "$TARGET_DATE"; then
+              break
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              echo "Snapshot build failed after three attempts; the published data is unchanged."
+              exit 1
+            fi
+            echo "Retrying the full validated build after a transient source failure (attempt ${attempt}/3)."
+            sleep 20
+          done
           if [[ -f /tmp/taiwan-stock-data/market_manifest.json ]]; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
           else

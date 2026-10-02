@@ -26,6 +26,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -43,6 +44,8 @@ USER_AGENT = (
 
 MOPS_LISTED = "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv"
 MOPS_OTC = "https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv"
+TWSE_STOCK_MASTER = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+TPEX_STOCK_MASTER = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
 TWSE_DAILY = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_DAILY = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 YAHOO_GLOBAL = "https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -101,9 +104,13 @@ def fetch_bytes(url: str, *, timeout: int = 60, attempts: int = 4) -> bytes:
             )
             with urlopen(request, timeout=timeout) as response:
                 return response.read()
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        except (HTTPError, URLError, TimeoutError, OSError, HTTPException) as exc:
             last_error = exc
             if attempt + 1 < attempts:
+                print(
+                    f"RETRY {attempt + 1}/{attempts}: {url}: {type(exc).__name__}",
+                    flush=True,
+                )
                 time.sleep(min(2**attempt + random.random(), 10))
     raise RuntimeError(f"request failed after {attempts} attempts: {url}: {last_error}")
 
@@ -119,19 +126,43 @@ def decode_csv(content: bytes) -> str:
 
 def fetch_stock_master() -> list[Instrument]:
     records: list[Instrument] = []
-    for market, suffix, url in (
-        ("TWSE", ".TW", MOPS_LISTED),
-        ("TPEx", ".TWO", MOPS_OTC),
+    for market, suffix, csv_url, api_url, api_id_key, api_name_key in (
+        ("TWSE", ".TW", MOPS_LISTED, TWSE_STOCK_MASTER, "公司代號", "公司簡稱"),
+        ("TPEx", ".TWO", MOPS_OTC, TPEX_STOCK_MASTER, "SecuritiesCompanyCode", "CompanyAbbreviation"),
     ):
-        reader = csv.DictReader(decode_csv(fetch_bytes(url)).splitlines())
-        for row in reader:
-            stock_id = str(row.get("公司代號", "")).strip()
-            stock_name = str(row.get("公司簡稱", "")).strip()
-            if not (len(stock_id) == 4 and stock_id.isdigit() and stock_name):
-                continue
-            records.append(
-                Instrument(stock_id, stock_name, market, f"{stock_id}{suffix}", "STOCK")
-            )
+        errors: list[str] = []
+        for url, id_key, name_key in (
+            (csv_url, "公司代號", "公司簡稱"),
+            (api_url, api_id_key, api_name_key),
+        ):
+            try:
+                content = fetch_bytes(url)
+                if url == csv_url:
+                    rows = list(csv.DictReader(decode_csv(content).splitlines()))
+                else:
+                    rows = json.loads(content)
+                    if not isinstance(rows, list):
+                        raise ValueError("official company API did not return a list")
+                market_records: dict[str, Instrument] = {}
+                for row in rows:
+                    stock_id = str(row.get(id_key, "")).strip()
+                    stock_name = str(row.get(name_key, "")).strip()
+                    if not (len(stock_id) == 4 and stock_id.isdigit() and stock_name):
+                        continue
+                    market_records[stock_id] = Instrument(
+                        stock_id, stock_name, market, f"{stock_id}{suffix}", "STOCK"
+                    )
+                # Never accept an empty/truncated feed just because HTTP succeeded.
+                if len(market_records) < 500:
+                    raise ValueError(f"{market} company list is too small: {len(market_records)}")
+                records.extend(market_records.values())
+                print(f"Company master {market}: {len(market_records)} via {url}", flush=True)
+                break
+            except (RuntimeError, ValueError, UnicodeError, AttributeError, TypeError) as exc:
+                errors.append(f"{url}: {exc}")
+                print(f"Company master source failed; trying official fallback: {url}: {exc}", flush=True)
+        else:
+            raise RuntimeError(f"All official company sources failed for {market}: " + "; ".join(errors))
     unique = {record.stock_id: record for record in records}
     return sorted(unique.values(), key=lambda row: (row.market, row.stock_id))
 
@@ -606,6 +637,17 @@ def build_assets(output_dir: Path, workers: int, today: date) -> None:
     )
 
 
+def default_target_date(now: datetime | None = None) -> date:
+    """Choose the latest closed weekday, including midnight/manual recovery runs."""
+    local_now = (now or datetime.now(TAIPEI)).astimezone(TAIPEI)
+    target = local_now.date()
+    if local_now.time() < datetime_time(14, 20):
+        target -= timedelta(days=1)
+    while target.weekday() >= 5:
+        target -= timedelta(days=1)
+    return target
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
@@ -621,7 +663,11 @@ def main() -> int:
     args = parse_args()
     if not 1 <= args.workers <= 32:
         raise SystemExit("--workers must be between 1 and 32")
-    today = date.fromisoformat(args.date) if args.date else datetime.now(TAIPEI).date()
+    latest_closed_date = default_target_date()
+    today = date.fromisoformat(args.date) if args.date else latest_closed_date
+    if today > latest_closed_date:
+        raise SystemExit("--date must not be later than the latest closed weekday")
+    print(f"Target closed trading date: {today.isoformat()}", flush=True)
     build_assets(args.output.resolve(), args.workers, today)
     return 0
 

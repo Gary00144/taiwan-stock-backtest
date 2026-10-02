@@ -5,10 +5,24 @@ Taiwan Stock Backtest site.
 
 ## Schedule
 
-- Monday-Friday at 14:20 `Asia/Taipei`.
-- A manual run is available through `workflow_dispatch`.
+- Monday-Friday at 14:20/14:40, 15:20/15:40, 16:20/16:40 and 20:20 `Asia/Taipei`.
+- A manual run is available through `workflow_dispatch`, with an optional `date`
+  input (`YYYY-MM-DD`) for recovering a closed trading day.
+- Midnight, weekend and pre-close runs target the latest closed weekday instead
+  of publishing intraday prices. Holidays still leave the previous snapshot intact.
 - The workflow also runs when the updater or workflow definition changes, which
   gives setup changes an immediate validation run.
+
+## Recovery
+
+- Incomplete HTTP responses are discarded and retried; partial content is never
+  accepted as a successful download.
+- If the MOPS CSV host is unavailable or its company list is unusable, the updater
+  uses TWSE/TPEx official company OpenAPI feeds, with per-market size checks.
+- A failed build is retried up to three times. Freshness checks skip any date that
+  is already covered by the published snapshot, including manual older dates.
+- Recovery downloads full history, so a snapshot for a later day also restores
+  missing earlier trading-day rows.
 
 ## Safety rules
 
@@ -34,3 +48,4 @@ generated payloads live under `generated-data/` and include:
 The `.bin` files are deterministic gzip-compressed JSON.  The site reads the
 manifest first and uses the bundled deployment data as a fallback if GitHub is
 temporarily unavailable.
+
