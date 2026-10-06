@@ -53,6 +53,7 @@ generated payloads live under `generated-data/` and include:
 - `market_monthly.bin`
 - `market_daily_YYYY.bin`
 - `market_data_status.json`
+- `market_closing_prices.json` — compact raw closing prices with each instrument's actual last trading date; used by the performance API when official closing feeds are unavailable.
 
 The `.bin` files are deterministic gzip-compressed JSON.  The site reads the
 manifest first and uses the bundled deployment data as a fallback if GitHub is
