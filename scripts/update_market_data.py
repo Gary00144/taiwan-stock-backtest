@@ -608,6 +608,20 @@ def write_gzip_json(path: Path, payload: Any) -> None:
         handle.write(encoded)
 
 
+def closing_price_payload(instruments: list[Instrument], histories: dict[str, list[DailyBar]], today: date, generated_at: str) -> dict[str, Any]:
+    """Small, unadjusted closing-price feed; never substitute adjusted history."""
+    rows = []
+    for instrument in instruments:
+        eligible = [bar for bar in histories.get(instrument.stock_id, [])
+                    if bar.trade_date <= today and finite_number(bar.raw_close) is not None and bar.raw_close > 0]
+        if not eligible:
+            continue
+        last = max(eligible, key=lambda bar: bar.trade_date)
+        rows.append([instrument.stock_id, last.trade_date.isoformat(), last.raw_close])
+    return {"schemaVersion": 1, "endDate": today.isoformat(), "generatedAt": generated_at,
+            "priceSource": "Yahoo Finance raw close", "rows": rows}
+
+
 def build_assets(output_dir: Path, workers: int, today: date) -> None:
     if not preflight_is_trading_day(today):
         print(f"SKIP: {today.isoformat()} is not a Yahoo Taiwan trading day")
@@ -720,6 +734,10 @@ def build_assets(output_dir: Path, workers: int, today: date) -> None:
         "priceSource": "Yahoo Finance",
     }
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "market_closing_prices.json").write_text(
+        json.dumps(closing_price_payload(instruments, histories, today, generated_at), ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     write_gzip_json(
         output_dir / "market_monthly.bin",
         {
